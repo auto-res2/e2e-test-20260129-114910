@@ -1114,5 +1114,169 @@
     "experimental_code": "import numpy as np\nfrom sklearn.metrics import f1_score\nfrom sklearn.cluster import KMeans\n\n# -----------------------------\n# Synthetic streaming DS benchmark with drift\n# -----------------------------\ndef make_stream(rng, n, K_true=5, splits=3, d=64, polysemy=2,\n                flip=0.12, type_noise=0.15, drift_at=0.6, drift_strength=0.7, T=6):\n    \"\"\"Returns a stream ordered in time. After drift_at fraction, one relation's mode/types shift.\"\"\"\n    K_obs = K_true * splits\n\n    # latent semantic modes (unit vectors)\n    mu_mode = rng.normal(size=(K_true, polysemy, d))\n    mu_mode /= np.linalg.norm(mu_mode, axis=-1, keepdims=True)\n\n    # drift: pick a latent relation and rotate its dominant mode\n    drift_rel = int(rng.integers(K_true))\n    new_dir = rng.normal(size=d)\n    new_dir /= np.linalg.norm(new_dir)\n    mu_mode_drift = mu_mode.copy()\n    mu_mode_drift[drift_rel, 0] = (1 - drift_strength) * mu_mode[drift_rel, 0] + drift_strength * new_dir\n    mu_mode_drift[drift_rel, 0] /= np.linalg.norm(mu_mode_drift[drift_rel, 0])\n\n    # observed labels means (fragmentation)\n    def obs_means(mu_mode_use):\n        mu_obs = np.zeros((K_obs, d))\n        for k in range(K_true):\n            for s in range(splits):\n                base = mu_mode_use[k, s % polysemy]\n                mu_obs[k * splits + s] = base + 0.05 * rng.normal(size=d)\n        mu_obs /= np.linalg.norm(mu_obs, axis=1, keepdims=True)\n        return mu_obs\n\n    mu_obs_pre = obs_means(mu_mode)\n    mu_obs_post = obs_means(mu_mode_drift)\n\n    # latent type-pair distributions pre/post\n    tp_pre = rng.dirichlet(alpha=np.ones(T*T), size=K_true)\n    tp_post = tp_pre.copy()\n    # drift types for the drifting relation\n    tp_post[drift_rel] = rng.dirichlet(alpha=np.ones(T*T))\n\n    # sample latent true relations with mild temporal non-iid\n    y_true = rng.integers(0, K_true, size=n)\n\n    # choose observed label among splits\n    y_obs = y_true * splits + rng.integers(0, splits, size=n)\n\n    # DS flips\n    m = rng.random(n) < flip\n    y_obs[m] = rng.integers(0, K_obs, size=m.sum())\n\n    # drift indicator\n    t = np.arange(n)\n    post = t >= int(drift_at * n)\n\n    # types sampled from pre/post tp\n    tp = np.where(post[:, None], tp_post[y_true], tp_pre[y_true])\n    tp_idx = np.array([rng.choice(T*T, p=tp[i]) for i in range(n)])\n    th, tt = tp_idx // T, tp_idx % T\n    corrupt = rng.random(n) < type_noise\n    th[corrupt] = rng.integers(0, T, size=corrupt.sum())\n    tt[corrupt] = rng.integers(0, T, size=corrupt.sum())\n\n    # embeddings pre/post\n    X = np.zeros((n, d))\n    X[~post] = mu_obs_pre[y_obs[~post]] + 0.30 * rng.normal(size=(~post).sum(), d)\n    X[post]  = mu_obs_post[y_obs[post]]  + 0.30 * rng.normal(size=post.sum(), d)\n    X /= np.linalg.norm(X, axis=1, keepdims=True)\n\n    return X, y_true, y_obs, th, tt, K_obs, T\n\n# -----------------------------\n# Prototype & type utilities\n# -----------------------------\ndef prototypes_from_labels(X, y, K):\n    d = X.shape[1]\n    P = np.zeros((K, d))\n    for k in range(K):\n        idx = (y == k)\n        if idx.sum() > 0:\n            P[k] = X[idx].mean(axis=0)\n    nrm = np.linalg.norm(P, axis=1, keepdims=True)\n    nrm[nrm == 0] = 1\n    return P / nrm\n\ndef predict_nearest_proto(X, P):\n    return (X @ P.T).argmax(axis=1)\n\ndef majority_map(src_labels, y_true, K_src, K_true):\n    m = np.zeros(K_src, dtype=int)\n    for k in range(K_src):\n        idx = (src_labels == k)\n        m[k] = 0 if idx.sum() == 0 else np.bincount(y_true[idx], minlength=K_true).argmax()\n    return m\n\ndef typepair_dist(y, th, tt, K, T, eps=1e-3):\n    q = np.zeros((K, T*T)) + eps\n    for k in range(K):\n        idx = (y == k)\n        if idx.sum() > 0:\n            bins = th[idx] * T + tt[idx]\n            q[k] += np.bincount(bins, minlength=T*T)\n    q /= q.sum(axis=1, keepdims=True)\n    return q\n\ndef jsd(p, q, eps=1e-12):\n    p = np.clip(p, eps, 1)\n    q = np.clip(q, eps, 1)\n    m = 0.5 * (p + q)\n    return 0.5 * (p * (np.log(p) - np.log(m))).sum() + 0.5 * (q * (np.log(q) - np.log(m))).sum()\n\n# -----------------------------\n# Anytime-valid lower confidence bound (stitched Hoeffding CS)\n# For bounded X in [-1, 1], a time-uniform CI can be obtained by adding a loglog term.\n# -----------------------------\ndef cs_lcb_mean(x, alpha=0.1):\n    x = np.asarray(x)\n    n = len(x)\n    if n == 0:\n        return -np.inf\n    m = float(x.mean())\n    # stitched/loglog width (simple, practical form)\n    loglog = np.log(np.log2(n + 1) + 1.0)\n    width = np.sqrt((2.0 * (np.log(2.0 / alpha) + loglog)) / n)  # for [-1,1]\n    return m - width\n\n# -----------------------------\n# AVaRiSM: split-merge with confidence-sequence gating\n# -----------------------------\ndef avarism_repair(rng, Xtr, ytr_true, ytr_obs, th_tr, tt_tr,\n                   Xcal, ycal_true, ycal_obs, th_cal, tt_cal,\n                   K_true, K_obs, T,\n                   tau=0.80, lam=1.0, eps=0.0,\n                   alpha_total=0.10, max_tests=80, max_merges=40, max_splits=20,\n                   split_disp=0.22):\n    # classes are sets of observed labels\n    classes = [{k} for k in range(K_obs)]\n\n    def assign_from_classes(y_obs, classes):\n        y = np.zeros_like(y_obs)\n        for ci, mem in enumerate(classes):\n            for k in mem:\n                y[y_obs == k] = ci\n        return y\n\n    def build_state(X, y, th, tt):\n        K = y.max() + 1\n        P = prototypes_from_labels(X, y, K)\n        Q = typepair_dist(y, th, tt, K, T)\n        return P, Q\n\n    def proxy_correctness(X, y_true, y_assign, P):\n        # proxy: agreement with mapped latent label (available in synthetic; in real DS use bag/type proxies)\n        pred_c = predict_nearest_proto(X, P)\n        c2t = majority_map(y_assign, y_true, P.shape[0], K_true)\n        return (c2t[pred_c] == y_true).astype(float)\n\n    # allocate per-edit alpha (simple alpha-spending)\n    alpha_e = alpha_total / max_tests\n    tests_used = 0\n\n    ytr_c = assign_from_classes(ytr_obs, classes)\n    ycal_c = assign_from_classes(ycal_obs, classes)\n    P, Q = build_state(Xtr, ytr_c, th_tr, tt_tr)\n    base_corr = proxy_correctness(Xcal, ycal_true, ycal_c, P)\n\n    def merge_score(i, j):\n        return float(P[i] @ P[j]) * np.exp(-lam * jsd(Q[i], Q[j]))\n\n    # --- MERGES (greedy) ---\n    for _ in range(max_merges):\n        if tests_used >= max_tests:\n            break\n        K = len(classes)\n        if K <= K_true:\n            break\n        # best pair\n        best = (-1, -1, -1e9)\n        for i in range(K):\n            for j in range(i+1, K):\n                s = merge_score(i, j)\n                if s > best[2]:\n                    best = (i, j, s)\n        i, j, s = best\n        if s < tau:\n            break\n\n        new_classes = [set(mem) for idx, mem in enumerate(classes) if idx not in (i, j)]\n        new_classes.append(set().union(classes[i], classes[j]))\n\n        ytr_p = assign_from_classes(ytr_obs, new_classes)\n        ycal_p = assign_from_classes(ycal_obs, new_classes)\n        Pp, Qp = build_state(Xtr, ytr_p, th_tr, tt_tr)\n\n        prop_corr = proxy_correctness(Xcal, ycal_true, ycal_p, Pp)\n        delta = (prop_corr - base_corr)  # in [-1,1]\n        lcb = cs_lcb_mean(delta, alpha=alpha_e)\n        tests_used += 1\n\n        if lcb >= -eps:\n            classes, ytr_c, ycal_c, P, Q, base_corr = new_classes, ytr_p, ycal_p, Pp, Qp, prop_corr\n        else:\n            break\n\n    # --- SPLITS (largest dispersion) ---\n    for _ in range(max_splits):\n        if tests_used >= max_tests:\n            break\n        K = len(classes)\n        disp = np.zeros(K)\n        for c in range(K):\n            idx = (ytr_c == c)\n            if idx.sum() >= 25:\n                disp[c] = float(1.0 - (Xtr[idx] @ P[c]).mean())\n        c = int(disp.argmax())\n        if disp[c] < split_disp:\n            break\n\n        idx = (ytr_c == c)\n        if idx.sum() < 60:\n            break\n\n        # typepair onehot feature to make split type-aware but still light\n        tp = (th_tr[idx] * T + tt_tr[idx])\n        tp_oh = np.eye(T*T, dtype=float)[tp]\n        Z = np.hstack([Xtr[idx], 0.4 * tp_oh])\n\n        km = KMeans(n_clusters=2, n_init=10, random_state=int(rng.integers(1e9)))\n        z = km.fit_predict(Z)\n\n        mem = classes[c]\n        left, right = set(), set()\n        for k in mem:\n            ids = np.where((ytr_obs == k) & idx)[0]\n            if len(ids) == 0:\n                left.add(k)\n                continue\n            # map local indices\n            local = np.flatnonzero(idx)\n            local_mask = np.isin(local, ids)\n            side = int(np.bincount(z[local_mask], minlength=2).argmax())\n            (left if side == 0 else right).add(k)\n\n        if len(left) == 0 or len(right) == 0:\n            break\n\n        new_classes = [set(m) for i, m in enumerate(classes) if i != c] + [left, right]\n\n        ytr_p = assign_from_classes(ytr_obs, new_classes)\n        ycal_p = assign_from_classes(ycal_obs, new_classes)\n        Pp, Qp = build_state(Xtr, ytr_p, th_tr, tt_tr)\n\n        prop_corr = proxy_correctness(Xcal, ycal_true, ycal_p, Pp)\n        delta = (prop_corr - base_corr)\n        lcb = cs_lcb_mean(delta, alpha=alpha_e)\n        tests_used += 1\n\n        if lcb >= -eps:\n            classes, ytr_c, ycal_c, P, Q, base_corr = new_classes, ytr_p, ycal_p, Pp, Qp, prop_corr\n        else:\n            break\n\n    return classes, P\n\n# -----------------------------\n# Evaluation helper\n# -----------------------------\ndef macro_f1_latent(Xtr, ytr_true, ytr_assign, P, Xte, yte_true):\n    pred_c = predict_nearest_proto(Xte, P)\n    c2t = majority_map(ytr_assign, ytr_true, P.shape[0], int(ytr_true.max() + 1))\n    pred_true = c2t[pred_c]\n    return f1_score(yte_true, pred_true, average='macro')\n\n# -----------------------------\n# Demo run\n# -----------------------------\nif __name__ == \"__main__\":\n    rng = np.random.default_rng(0)\n    K_true, splits, d = 5, 3, 64\n\n    X, y_true, y_obs, th, tt, K_obs, T = make_stream(rng, 3000, K_true=K_true, splits=splits, d=d)\n\n    # time split: train / cal / test are consecutive to respect drift\n    n = len(X)\n    tr, cal = int(0.45*n), int(0.70*n)\n    Xtr, ytr_true, ytr_obs, th_tr, tt_tr = X[:tr], y_true[:tr], y_obs[:tr], th[:tr], tt[:tr]\n    Xcal, ycal_true, ycal_obs, th_cal, tt_cal = X[tr:cal], y_true[tr:cal], y_obs[tr:cal], th[tr:cal], tt[tr:cal]\n    Xte, yte_true, yte_obs, th_te, tt_te = X[cal:], y_true[cal:], y_obs[cal:], th[cal:], tt[cal:]\n\n    # Baseline: fixed observed-label prototypes\n    P_obs = prototypes_from_labels(Xtr, ytr_obs, K_obs)\n    f1_fixed = macro_f1_latent(Xtr, ytr_true, ytr_obs, P_obs, Xte, yte_true)\n\n    # Merge-only heuristic baseline (cosine threshold)\n    tau = 0.80\n    S = P_obs @ P_obs.T\n    parent = list(range(K_obs))\n    def find(a):\n        while parent[a] != a:\n            parent[a] = parent[parent[a]]\n            a = parent[a]\n        return a\n    def union(a,b):\n        ra, rb = find(a), find(b)\n        if ra != rb:\n            parent[rb] = ra\n    for i in range(K_obs):\n        for j in range(i+1, K_obs):\n            if S[i, j] > tau:\n                union(i, j)\n    comps = {}\n    for k in range(K_obs):\n        comps.setdefault(find(k), set()).add(k)\n    classes_merge = list(comps.values())\n    ytr_c = np.zeros_like(ytr_obs)\n    for ci, mem in enumerate(classes_merge):\n        for k in mem:\n            ytr_c[ytr_obs == k] = ci\n    P_merge = prototypes_from_labels(Xtr, ytr_c, len(classes_merge))\n    f1_merge = macro_f1_latent(Xtr, ytr_true, ytr_c, P_merge, Xte, yte_true)\n\n    # Proposed: AVaRiSM\n    classes, P = avarism_repair(\n        rng,\n        Xtr, ytr_true, ytr_obs, th_tr, tt_tr,\n        Xcal, ycal_true, ycal_obs, th_cal, tt_cal,\n        K_true, K_obs, T,\n        tau=0.80, lam=1.0, eps=0.0,\n        alpha_total=0.10, max_tests=80\n    )\n    ytr_r = np.zeros_like(ytr_obs)\n    for ci, mem in enumerate(classes):\n        for k in mem:\n            ytr_r[ytr_obs == k] = ci\n    f1_avarism = macro_f1_latent(Xtr, ytr_true, ytr_r, P, Xte, yte_true)\n\n    print({\n        \"f1_fixed\": float(f1_fixed),\n        \"f1_merge_only\": float(f1_merge),\n        \"f1_avarism\": float(f1_avarism),\n        \"K_obs\": int(K_obs),\n        \"K_merge_only\": int(len(classes_merge)),\n        \"K_avarism\": int(len(classes))\n    })\n",
     "expected_result": "On the drifting synthetic DS benchmark (fragmentation + polysemy + noisy types + temporal drift), we expect:\n- **Fixed Proto:** Macro-F1 ≈ 0.65–0.75 (drift hurts because observed labels stay fragmented and polysemous).\n- **Merge-only:** Macro-F1 ≈ 0.70–0.80, with occasional catastrophic collapses when drift causes semantically nearby-but-distinct relations to be merged.\n- **Bootstrap-gated split–merge (RiSM):** Macro-F1 ≈ 0.76–0.84 but with non-trivial variance, because adaptive re-testing can still accept a harmful edit under repeated proposals.\n- **AVaRiSM (proposed):** Macro-F1 ≈ 0.80–0.88, with **lower variance across seeds** and fewer harmful accepted edits. A typical target is **+0.05 to +0.10** absolute Macro-F1 over Merge-only and **+0.02 to +0.05** over bootstrap-gated RiSM.\n\nDirection: higher Macro-F1 is better. We also expect the catastrophic-collapse rate to drop substantially (e.g., from ~10–20% of runs in Merge-only to <5% with AVaRiSM).",
     "expected_conclusion": "AVaRiSM elevates periodic KG schema reorganization from a clustering heuristic into an **audited online decision process** that remains reliable under the realities of streaming extraction: adaptive proposal generation, repeated checking, and early stopping.\n\nAcademic value: contributes a new connection between (i) continual label-space/ontology repair in relation extraction and (ii) **anytime-valid statistical inference (confidence sequences)**, yielding a principled “do-no-harm” mechanism under adaptivity—an aspect not addressed by prior prototype-based RE (ProtoRE/REGRAB) or by heuristic schema merging.\n\nPractical/social value: for Japanese Wikipedia-scale KG construction, schema errors are expensive and compound over time. An anytime-valid audit gate makes automated split/merge updates safer and more stable, reducing manual property curation burden and improving KG maintainability, interoperability, and downstream query reliability."
+  },
+  "experimental_design": {
+    "experiment_summary": "Task: maintain and repair a relation schema online for a distantly-supervised KG-from-text pipeline. Given a stream of relation-mention instances (sentence context + entity-pair type hints + noisy DS relation label), the system must (i) assign each instance to a current schema relation and (ii) periodically propose and decide schema edits (merges/splits) so that downstream relation prediction on a future window improves or at least does not degrade.\n\nPurpose: demonstrate that **AVaRiSM** (Anytime-Valid Risk-Controlled Split–Merge Repair) yields higher final-window macro-F1 and fewer collapse events than a bootstrap-gated split–merge baseline under **adaptive, repeated edit proposals**.\n\nWorkflow (single-run):\n1) **Encode** each mention context with a frozen encoder (BERT-base) to a d-dimensional embedding; concatenate lightweight type-pair features (head_type, tail_type) if available.\n2) **Initialize schema** with DS relation labels (or DS-label fragments) as classes; maintain per-class prototype vectors and smoothed head/tail type-pair distributions.\n3) **Streaming training**: process the dataset in time-ordered mini-batches; every M batches run schema reorganization:\n   - Propose **merge candidates** by prototype cosine similarity tempered by type-distribution divergence.\n   - Propose **split candidates** for high-dispersion classes via 2-way spherical k-means on [embedding | type features].\n4) **Online audit (decision gate)** on an independent calibration stream: for each proposed edit, compute bounded per-instance proxy delta Δ in a correctness proxy under (edited schema) vs (current schema), then maintain a **time-uniform lower confidence bound (confidence sequence)** on E[Δ]. Accept edit iff LCB_t ≥ -ε, while **spending** a global α-budget across all edits.\n5) **Evaluate** on a future held-out test window (never used in proposals or audits).\n\nScale to fit Runner: use a single GPU (A100/H200) with a frozen encoder and batched embedding extraction; all schema operations are CPU/Numpy/Sklearn-level. Target sizes: ~200k train stream + 50k calibration stream + 50k test stream (or smaller if using a pre-split NYT10 variant), 10 seeds. This is comfortably within the provided 80GB+ VRAM / 2TB RAM, and also fast enough to run full multi-seed sweeps on one runner (embeddings cached to disk; schema repair is lightweight).",
+    "runner_config": {
+      "runner_label": [
+        "self-hosted",
+        "gpu-runner"
+      ],
+      "description": "NVIDIA A100 or H200, VRAM: 80 GB or more, RAM: 2048 GB or more"
+    },
+    "evaluation_metrics": [
+      {
+        "name": "f1_score",
+        "description": "**What is scored:** final-window relation prediction quality after online schema evolution.\n\n**Correctness criteria:** A test instance is correct if its predicted relation (after mapping predicted schema classes to gold relations) equals the gold relation label.\n\n**Label mapping (required because schema size may change):** Compute a mapping from predicted classes C to gold relations R using the training window only (never using calibration/test). Two implementation options:\n- **Majority-vote mapping:** map each predicted class c to the most frequent gold relation r among training instances assigned to c.\n- **Hungarian matching (optional):** maximize total correct assignments over a confusion matrix on the training window.\n\n**Calculation method:** Let TP_r, FP_r, FN_r be computed per gold relation r after mapping. Per-relation F1 is F1_r = 2·TP_r/(2·TP_r+FP_r+FN_r) with 0 when denominator=0. Report **macro-F1**: (1/|R|)·∑_r F1_r. (If the dataset includes a ‘NA/no_relation’ label, report both including and excluding NA as a sensitivity analysis.)\n\n**Task appropriateness:** schema repair changes the label space; macro-F1 (with mapping) measures whether reorganizations help true relation discrimination rather than only optimizing proxy objectives.\n\n**Relevant visualizations:** (i) Confusion matrix heatmap (mapped predicted vs gold) on the final test window; (ii) macro-F1 across time windows (line plot) to show drift/collapse; (iii) per-relation F1 bar plot to see which relations benefit/hurt."
+      },
+      {
+        "name": "catastrophic_collapse_rate",
+        "description": "**What is scored:** how often a run suffers an irreversible schema drift/collapse.\n\n**Correctness criteria:** A run is marked as a catastrophic collapse if *either*:\n1) **Predictive collapse:** final-window f1_score is below a fixed floor (e.g., < 0.20), or drops by more than δ compared to a no-reorg baseline on the same seed (e.g., f1_score(method) < f1_score(fixed_proto) − 0.15).\n2) **Structural collapse:** number of schema classes K_t falls below a minimum viable threshold (e.g., K_t < 0.3·K_init) *and* the predicted class distribution entropy H(pred) on the test window falls below a threshold, indicating near-single-class behavior.\n\n**Calculation method:** collapse_rate = (#collapsed runs)/(#total runs).\n\n**Task appropriateness:** the hypothesis targets catastrophic, irreversible schema drift due to adaptive repeated testing; a collapse-rate directly measures this failure mode.\n\n**Relevant visualizations:** (i) Histogram of final f1_score per seed; (ii) time series of K_t and entropy H_t per run with collapsed runs highlighted."
+      },
+      {
+        "name": "harmful_edit_accept_count",
+        "description": "**What is scored:** how many accepted edits were actually harmful in hindsight.\n\n**Correctness criteria:** An accepted edit e at time t is ‘harmful’ if it decreases a **locked shadow metric** on a shadow set that is never used for proposal generation or audit decisions (e.g., a small ‘shadow-eval’ slice carved out of the calibration window, or an earlier frozen dev window): shadow_delta(e) = f1_shadow(after e) − f1_shadow(before e) < 0.\n\n**Calculation method:** For each accepted edit, evaluate f1_shadow using the same class→gold mapping protocol (computed from a fixed training prefix). Count harmful edits: ∑_e 1[shadow_delta(e)<0]. Optionally also report harmful_edit_rate = harmful_count / accepted_count.\n\n**Task appropriateness:** AVaRiSM’s claim is ‘do-no-harm under adaptivity’; this metric approximates the ground-truth notion of harm using a non-peeked evaluator, allowing diagnosis even when DS labels are noisy.\n\n**Relevant visualizations:** (i) Waterfall plot of cumulative shadow f1 changes over accepted edits; (ii) scatter of audit LCB at acceptance vs shadow_delta to check calibration."
+      },
+      {
+        "name": "accepted_edit_count",
+        "description": "**What is scored:** how many schema edits the system accepts.\n\n**Correctness criteria:** An edit is counted when the system changes the schema (merge or split) and updates prototypes/types.\n\n**Calculation method:** accepted_edit_count = (#accepted merges) + (#accepted splits). Also break down by type.\n\n**Task appropriateness:** separates ‘being conservative’ from ‘being accurate’; a method that never edits may avoid harm but also fail to repair fragmentation.\n\n**Relevant visualizations:** (i) Bar plot: accepted merges vs splits; (ii) accepted edits over time (step plot)."
+      },
+      {
+        "name": "time_to_decision",
+        "description": "**What is scored:** audit efficiency—how quickly the method can accept/reject edits.\n\n**Correctness criteria:** For each proposed edit, measure the number of calibration instances consumed until the stopping condition is met:\n- AVaRiSM: first t such that LCB_t ≥ −ε (accept) or proposal budget exhausted/optional UCB_t < −ε (reject).\n- Baseline (RiSM-bootstrap): fixed sample size N_boot or a fixed calibration batch size.\n\n**Calculation method:** Report mean/median calibration instances per decided edit, and separately for accepted vs rejected.\n\n**Task appropriateness:** confidence sequences are designed for optional stopping; this metric shows the practical benefit (anytime decisions) and helps tune audit budgets.\n\n**Relevant visualizations:** ECDF of time_to_decision; boxplots grouped by accept/reject."
+      },
+      {
+        "name": "seed_stability_std",
+        "description": "**What is scored:** run-to-run stability under different random seeds.\n\n**Correctness criteria:** Not a per-example metric; it measures variability.\n\n**Calculation method:** Compute the sample standard deviation of final-window f1_score across S seeds: std = sqrt( (1/(S−1))·∑_s (F1_s − mean(F1))^2 ).\n\n**Task appropriateness:** the failure mode described includes high variance and occasional collapses; lower variance is an explicit benefit of risk-controlled auditing.\n\n**Relevant visualizations:** error bars (mean±std) for each method; violin plots of f1_score per method."
+      }
+    ],
+    "models_to_use": [
+      "bert-base-uncased (110M parameters; frozen encoder for mention embeddings)"
+    ],
+    "datasets_to_use": [
+      "NYT10 (Distantly Supervised Relation Extraction; commonly distributed via OpenNRE/NYT10 or HF mirrors; used as a time-ordered stream)"
+    ],
+    "proposed_method": {
+      "method_name": "AVaRiSM (Anytime-Valid Risk-Controlled Split–Merge Repair)",
+      "description": "Online relation-schema split/merge repair for KG-from-text under distant supervision. Proposes merges/splits using prototype geometry + type-distribution similarity, but **accepts an edit only if a time-uniform lower confidence bound (confidence sequence) on the expected proxy delta satisfies LCB ≥ −ε**, while spending a global α budget across adaptive, repeated proposals. This yields statistically meaningful do-no-harm control under optional stopping and adaptive edit generation.",
+      "optuna_config": {
+        "enabled": true,
+        "n_trials": 20,
+        "search_spaces": [
+          {
+            "param_name": "tau_merge",
+            "distribution_type": "uniform",
+            "low": 0.6,
+            "high": 0.95
+          },
+          {
+            "param_name": "lambda_type_jsd",
+            "distribution_type": "loguniform",
+            "low": 0.1,
+            "high": 5.0
+          },
+          {
+            "param_name": "epsilon_non_degradation",
+            "distribution_type": "uniform",
+            "low": 0.0,
+            "high": 0.03
+          },
+          {
+            "param_name": "alpha_total",
+            "distribution_type": "loguniform",
+            "low": 0.01,
+            "high": 0.2
+          },
+          {
+            "param_name": "max_tests",
+            "distribution_type": "int",
+            "low": 20.0,
+            "high": 200.0
+          },
+          {
+            "param_name": "split_dispersion_threshold",
+            "distribution_type": "uniform",
+            "low": 0.1,
+            "high": 0.4
+          },
+          {
+            "param_name": "reorg_period_M_batches",
+            "distribution_type": "int",
+            "low": 50.0,
+            "high": 400.0
+          },
+          {
+            "param_name": "use_type_features",
+            "distribution_type": "categorical",
+            "choices": [
+              0,
+              1
+            ]
+          }
+        ]
+      }
+    },
+    "comparative_methods": [
+      {
+        "method_name": "RiSM (Bootstrap-gated Split–Merge Repair; baseline)",
+        "description": "Prototype-based split–merge schema repair where candidate merges/splits are proposed from embedding geometry (and optional types) and then accepted/rejected using **fixed-time** bootstrap (or t-test) validation on a calibration batch. This baseline is vulnerable to adaptive repeated testing/peeking because its validation is not anytime-valid.",
+        "optuna_config": {
+          "enabled": true,
+          "n_trials": 20,
+          "search_spaces": [
+            {
+              "param_name": "tau_merge",
+              "distribution_type": "uniform",
+              "low": 0.6,
+              "high": 0.95
+            },
+            {
+              "param_name": "lambda_type_jsd",
+              "distribution_type": "loguniform",
+              "low": 0.1,
+              "high": 5.0
+            },
+            {
+              "param_name": "bootstrap_samples_B",
+              "distribution_type": "int",
+              "low": 50.0,
+              "high": 1000.0
+            },
+            {
+              "param_name": "fixed_calibration_batch_size",
+              "distribution_type": "int",
+              "low": 1000.0,
+              "high": 30000.0
+            },
+            {
+              "param_name": "p_value_threshold",
+              "distribution_type": "uniform",
+              "low": 0.01,
+              "high": 0.2
+            },
+            {
+              "param_name": "split_dispersion_threshold",
+              "distribution_type": "uniform",
+              "low": 0.1,
+              "high": 0.4
+            },
+            {
+              "param_name": "reorg_period_M_batches",
+              "distribution_type": "int",
+              "low": 50.0,
+              "high": 400.0
+            },
+            {
+              "param_name": "use_type_features",
+              "distribution_type": "categorical",
+              "choices": [
+                0,
+                1
+              ]
+            }
+          ]
+        }
+      }
+    ]
   }
 }
