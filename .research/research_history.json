@@ -1,0 +1,8 @@
+{
+  "research_topic": "# Structuring Knowledge Graphs from Document Collections  Develop a method to extract entities, relations, and triples from Japanese document collections (such as Wikipedia) and construct knowledge graphs. Assign a class name to each entity and relation. During extraction, periodically reorganize the knowledge graph schema after extracting a sufficient number of entities.",
+  "queries": [
+    "Japanese relation extraction",
+    "knowledge graph schema induction",
+    "ontology learning Wikipedia"
+  ]
+}
